@@ -1,0 +1,52 @@
+cuda/ 下面的 .cu 文件不参与主项目的 CMake 构建——它们是独立的教学代码，
+需要用 nvcc 手动编译。主要是两个文件:
+
+========================================
+paged_attention.cu
+========================================
+
+PagedAttention 的 CUDA kernel 实现，照着 vLLM 论文写的。
+里面有两个 kernel: store_kv_kernel（写 KV 进分页 cache）和
+paged_attention_kernel（遍历 block table 做 online softmax attention），
+还有一个 host 端 demo 用 mock 数据跑一遍验证寻址逻辑。
+
+编译:
+
+  nvcc -O2 -arch=sm_<你的GPU架构> paged_attention.cu -o paged_attention_test
+
+  -arch 要匹配你的 GPU 型号:
+    RTX 30 系列 (Ampere):   sm_80 或 sm_86
+    RTX 40 系列 (Ada):      sm_89    (需要 CUDA 12.x)
+    A100:                   sm_80
+    H100:                   sm_90    (需要 CUDA 12.x)
+
+  不知道怎么查？nvidia-smi 看型号 → Wikipedia 搜 "CUDA compute capability"
+
+  比如 RTX 4080 + CUDA 12.1:
+    nvcc -O2 -arch=sm_89 paged_attention.cu -o paged_attention_test
+
+运行:
+
+  ./paged_attention_test
+
+预期输出: store_kv 写入成功确认 + paged_attention 跑出几个浮点数。
+用的是 mock 数据（全零 query），输出值本身不重要，能跑完不出错就行。
+
+注意: 这个 CUDA 文件是教学用的，main() 里 cudaMalloc 的返回值没检查，
+生产代码每个 cudaMalloc/cudaMemcpy 后面都应该 cudaGetLastError()。
+还有就是如果你的 nvcc 太老（<=11.5），可能不认识 sm_89，换个能支持的最高
+arch（比如 sm_80）也行，只要你的 GPU 兼容。
+
+========================================
+cuda_techniques.cu
+========================================
+
+CUDA 优化技巧集锦，8 个独立 kernel 每块带详细注释和手算走读。
+主要是读的，不是跑的——main() 里只打印技巧列表。
+
+如果非要编译看看:
+  nvcc -O2 cuda_techniques.cu -o cuda_techniques
+  ./cuda_techniques  # 只打一个列表，不会跑 kernel
+
+推荐阅读顺序: 1 → 4 → 2 → 5 → 3 → 8 → 6 → 7
+（先搞懂 stride loop，然后 grid-stride，再 reduction...）

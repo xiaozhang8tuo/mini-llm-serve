@@ -1,0 +1,63 @@
+
+ store_kv 的输入/输出 和 paged_attention 的输入/输出
+ 放在 Transformer 一层的计算流里讲清楚
+
+=== 场景: Decode 第 N+1 个 token, 执行第 L 层 ===
+
+输入状态:
+  x_new: [1, hidden_dim]          ← 上一层的输出 (1个token, 新算出来的)
+  KV_cache_L: 已经存了 N 个历史 token 的 K,V
+
+第 L 层执行步骤:
+
+Step 1: 计算 Q, K, V (线性投影)
+  Q_new = x_new @ W_q  → [1, num_heads*head_dim]  ← 展平, 所有head拼在一起
+  K_new = x_new @ W_k  → [1, num_heads*head_dim]
+  V_new = x_new @ W_v  → [1, num_heads*head_dim]
+
+  ┌─ 此时 K_new/V_new 还不是分块存储的, 是连续的一维数组
+  │  Q_new 直接给 attention 用, 不需要存 cache
+  └  K_new/V_new 需要写入 KV cache (按 block 分页存)
+
+Step 2: store_kv — 把 K_new, V_new 写入 KV cache
+  输入:
+    seq_id         = 0             (哪个请求)
+    token_idx      = N             (这是第 N 个 token, 0-based)
+    k_all          = K_new         (所有 head 的 K 拼在一起: [32*128] 个 float)
+    v_all          = V_new         (所有 head 的 V 拼在一起)
+  输出:
+    无返回值, 副作用: KV_cache_L 被更新
+  做的事情:
+    token_idx=35 → lb=2, off=3, phy=block_tables[0][2]=12
+    for head h in 0..31:
+      key_cache_L[phy=12][h][off=3][0..127] = K_new[h*128 : (h+1)*128]
+      value_cache_L[phy=12][h][off=3][0..127] = V_new[h*128 : (h+1)*128]
+  ← K_new 的维度从 [1, 32*128] 拆成 32 个头, 每个写入各自的位置
+
+Step 3: paged_attention — 用 Q_new 和所有缓存的 K,V 做 attention
+  输入:
+    seq_id, head_idx, ctx_len=N+1
+    q              = Q_new[head_idx]  ← 这个 head 的 query: [128] 维向量
+  输出:
+    out            = [128] 维向量   ← attention 的结果 (这个head的输出)
+  做的事情:
+    遍历 block_table[0] = [3, 7, 12]
+    block 3 (phy=3): 读 key_cache_L[3][head][0..15][:], val_cache_L[3][head][0..15][:]
+    block 7 (phy=7): 读 key_cache_L[7][head][0..15][:], val_cache_L[7][head][0..15][:]
+    block 12(phy=12):读 key_cache_L[12][head][0..3][:], val_cache_L[12][head][0..3][:]
+    q 和每个 K 做点积得到分数 → softmax → 按权重累加 V → out
+
+  ← 这步只做 head 的注意力, 32个head独立计算 (GPU上并行)
+  ← 32个head的 out 拼起来就是这层的 attention 输出: [1, 32*128]
+
+然后 FFN 处理 → 下一层 → 重复 Step1-3 → 最终输出层 → 预测下一个token
+
+==== 关键理解 ====
+
+store_kv 和 paged_attention 不是互相调用的关系
+它们是同一层的两个独立步骤, 串行执行:
+  Layer_L: compute QKV → store_kv(K_new,V_new) → paged_attention(Q_new) → FFN
+
+store_kv 的输入来自 x @ W_k/W_v (刚算出来的新KV)
+paged_attention 的输入来自模型参数和 KV cache (Q是新算的, K/V是从cache读的)
+
